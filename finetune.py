@@ -12,6 +12,38 @@ from datasets.imagenet import ImageNet98p, ImageNet
 from utils import ModelWrapper, maybe_dictionarize_batch, cosine_lr
 from zeroshot import zeroshot_classifier
 from openai_imagenet_template import openai_imagenet_template
+from sparse_linear_layer import SparseLinearLayer
+
+
+# this goes through and replaces all linear layers with linear_replacement
+# it also copies the weights from the old linear layer to the new one
+# and sets the scores to be weights.abs() which seems reasonable to me for fine-tuning
+# also set requires_grad false for the weights and bias
+def replace_linear(model, linear_replacement, skip_modules=["lm_head", "conv1", "embedding"]):
+    for name, module in model.named_children():
+        if len(list(module.children())) > 0:
+            replace_linear(module, linear_replacement, skip_modules)
+
+        if isinstance(module, torch.nn.Linear) and name not in skip_modules:
+            # For now we just replace the c_fc and c_proj layers.
+            if name in ['c_fc', 'c_proj']:
+                old_module = model._modules[name]
+                model._modules[name] = linear_replacement(
+                    module.in_features,
+                    module.out_features,
+                    module.bias is not None,
+                )
+
+                model._modules[name].weight.data.copy_(old_module.weight.data)
+                if model._modules[name].bias is not None:
+                    model._modules[name].bias.data.copy_(old_module.bias)
+                model._modules[name].scores.data.copy_(old_module.weight.data.abs())
+
+                model._modules[name].weight.requires_grad = False
+                model._modules[name].bias.requires_grad = False
+
+    return model
+
 
 
 def parse_arguments():
@@ -19,13 +51,13 @@ def parse_arguments():
     parser.add_argument(
         "--data-location",
         type=str,
-        default=os.path.expanduser('~/data'),
+        default=os.path.expanduser('/data/yfcc-tmp/data'),
         help="The root directory for the datasets.",
     )
     parser.add_argument(
         "--model-location",
         type=str,
-        default=os.path.expanduser('~/ssd/checkpoints/soups'),
+        default=os.path.expanduser('checkpoints_folder'),
         help="Where to download the models.",
     )
     parser.add_argument(
@@ -60,6 +92,12 @@ def parse_arguments():
         "--wd",
         type=float,
         default=0.1,
+    )
+    parser.add_argument(
+        "--prune-rate",
+        type=float,
+        default=0.5,
+        help="0 means no pruning, 1 means all the pruning"
     )
     parser.add_argument(
         "--model",
@@ -101,15 +139,25 @@ if __name__ == '__main__':
     NUM_CLASSES = len(train_dset.classnames)
     feature_dim = base_model.visual.output_dim
 
+    # go through the model and swap out the linear layers with sparse linear layers
+    replace_linear(base_model.visual, SparseLinearLayer)
+    base_model.apply(lambda m : setattr(m, 'prune_rate', args.prune_rate))
+
     model = ModelWrapper(base_model, feature_dim, NUM_CLASSES, normalize=True, initial_weights=clf)
     for p in model.parameters():
         p.data = p.data.float()
+
+    # turn off the grad to everything that is not scores
+    for n, p in model.named_parameters():
+        if 'scores' not in n:
+            p.requires_grad = False
 
     model = model.cuda()
     devices = [x for x in range(torch.cuda.device_count())]
     model = torch.nn.DataParallel(model,  device_ids=devices)
 
     model_parameters = [p for p in model.parameters() if p.requires_grad]
+    print('optimizing {} params'.format(len(model_parameters)))
     optimizer = torch.optim.AdamW(model_parameters, lr=args.lr, weight_decay=args.wd)
 
     num_batches = len(train_dset.train_loader)
@@ -117,9 +165,9 @@ if __name__ == '__main__':
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    model_path = os.path.join(args.model_location, f'{args.name}_0.pt')
-    print('Saving model to', model_path)
-    torch.save(model.module.state_dict(), model_path)
+    # model_path = os.path.join(args.model_location, f'{args.name}_0.pt')
+    # print('Saving model to', model_path)
+    # torch.save(model.module.state_dict(), model_path)
 
     for epoch in range(args.epochs):
         # Train
